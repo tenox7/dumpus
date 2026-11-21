@@ -98,8 +98,13 @@ struct ContentView: View {
             buttons
         }
         .padding(20)
-        .frame(width: 420, height: 320)
+        .frame(width: 420, height: 340)
         .onAppear { syncSelection() }
+        .onChange(of: appState.isError) { failed in
+            guard failed else { return }
+            NSSound.beep()
+            NSApp.requestUserAttention(.criticalRequest)
+        }
         .onChange(of: diskManager.disks) { _ in syncSelection() }
         .onChange(of: selectedID) { _ in updateAutoName() }
         .alert("Replace existing files?", isPresented: $showReplace) {
@@ -111,15 +116,35 @@ struct ContentView: View {
     }
 
     private var progressSection: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            ProgressView(value: appState.progress)
-                .scaleEffect(y: 4, anchor: .center)
-            Text(appState.status)
-                .font(.caption)
-                .foregroundColor(appState.isError ? .red : .secondary)
-                .lineLimit(2)
-                .textSelection(.enabled)
+        Group {
+            if appState.isError {
+                HStack(spacing: 10) {
+                    Image(systemName: "xmark.octagon.fill")
+                        .font(.system(size: 36))
+                        .foregroundColor(.red)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("ERROR")
+                            .font(.headline)
+                            .foregroundColor(.red)
+                        Text(appState.status)
+                            .font(.caption)
+                            .lineLimit(3)
+                            .textSelection(.enabled)
+                    }
+                }
+            } else {
+                VStack(alignment: .leading, spacing: 4) {
+                    ProgressView(value: appState.progress)
+                        .scaleEffect(y: 4, anchor: .center)
+                    Text(appState.status)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .lineLimit(2)
+                        .textSelection(.enabled)
+                }
+            }
         }
+        .frame(maxWidth: .infinity, minHeight: 52, alignment: .bottomLeading)
     }
 
     private var buttons: some View {

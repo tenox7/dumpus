@@ -154,6 +154,12 @@ final class DiskManager: ObservableObject {
         throw DumpError("No data track on this CD (audio CD?)")
     }
 
+    static func exists(_ bsd: String) -> Bool {
+        guard let entry = service(bsd) else { return false }
+        IOObjectRelease(entry)
+        return true
+    }
+
     /// Mounted file systems on the disk, its partitions and synthesized (APFS) children.
     static func mountedVolumes(of bsd: String) -> [Volume] {
         guard let entry = service(bsd) else { return [] }

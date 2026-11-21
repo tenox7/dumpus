@@ -3,7 +3,12 @@ import DiskArbitration
 
 struct DumpError: Error {
     let message: String
-    init(_ message: String) { self.message = message }
+    let isCancel: Bool  // the user stopped it: not an error
+
+    init(_ message: String, isCancel: Bool = false) {
+        self.message = message
+        self.isCancel = isCancel
+    }
 }
 
 /// Mount, unmount and eject with DiskArbitration. The calls block: use them off the main thread.

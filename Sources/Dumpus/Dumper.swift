@@ -17,7 +17,7 @@ struct DumpJob {
 }
 
 extension DumpError {
-    static let cancelled = DumpError("Cancelled")
+    static let cancelled = DumpError("Cancelled", isCancel: true)
 }
 
 final class Dumper {
@@ -47,11 +47,15 @@ final class Dumper {
     // MARK: - Operations (call on the main thread)
 
     func dump(_ job: DumpJob) {
-        run { try self.perform(job) }
+        run {
+            try Self.requireDisk(job.disk)
+            return try self.perform(job)
+        }
     }
 
     func mount(_ bsd: String) {
         run {
+            try Self.requireDisk(bsd)
             self.setStatus("Mounting…")
             try DiskOps.mount(bsd)
             let paths = DiskManager.dataVolumes(of: bsd).map(\.path.path)
@@ -61,6 +65,7 @@ final class Dumper {
 
     func unmount(_ bsd: String) {
         run {
+            try Self.requireDisk(bsd)
             self.setStatus("Unmounting…")
             if !DiskManager.mountedVolumes(of: bsd).isEmpty { try DiskOps.unmount(bsd) }
             return "Unmounted"
@@ -69,10 +74,15 @@ final class Dumper {
 
     func eject(_ bsd: String) {
         run {
+            try Self.requireDisk(bsd)
             self.setStatus("Ejecting…")
             try DiskOps.eject(bsd)
             return "Ejected"
         }
+    }
+
+    private static func requireDisk(_ bsd: String) throws {
+        guard DiskManager.exists(bsd) else { throw DumpError("/dev/\(bsd) is not there. Insert the disc again.") }
     }
 
     static func stopRunningTool() {
@@ -92,8 +102,9 @@ final class Dumper {
             do {
                 message = try work()
             } catch {
-                message = (error as? DumpError)?.message ?? error.localizedDescription
-                failed = message != DumpError.cancelled.message
+                let dumpError = error as? DumpError ?? DumpError(error.localizedDescription)
+                message = dumpError.message
+                failed = !dumpError.isCancel
             }
             DispatchQueue.main.async {
                 self.appState.status = message
@@ -190,66 +201,51 @@ final class Dumper {
             let reason = errnoString()
             throw DumpError("\(tag): cannot create \(url.lastPathComponent): \(reason)")
         }
-        var outOpen = true
-        defer { if outOpen { close(out) } }
+        var isOpen = true
+        do {
+            try copy(from: fd, to: out, total: total, sector: sector, chunk: chunk, tag: tag, path: path)
+            isOpen = false
+            guard close(out) == 0 else {
+                let reason = errnoString()
+                throw DumpError("\(tag): write error: \(reason)")
+            }
+        } catch {
+            if isOpen { close(out) }
+            unlink(url.path)  // never keep an incomplete image
+            throw error
+        }
+        return url.lastPathComponent
+    }
+
+    /// Copies the device to the file. Stops at the first read error, with no retries:
+    /// a disc with errors must be cleaned and dumped again.
+    private func copy(from fd: Int32, to out: Int32, total: UInt64, sector: Int, chunk: Int,
+                      tag: String, path: String) throws {
         guard let buf = valloc(chunk) else { throw DumpError("\(tag): out of memory") }
         defer { free(buf) }
-
         let start = Date()
         var lastReport = Date.distantPast
         var offset: UInt64 = 0
         while offset < total {
+            if appState.cancelled { throw DumpError.cancelled }
             let len = Int(min(UInt64(chunk), total - offset))
-            let (got, err) = appState.cancelled ? (0, 0) : readBlock(fd, buf, len, offset, sector)
-            if appState.cancelled {
-                close(out)
-                outOpen = false
-                unlink(url.path)
-                throw DumpError.cancelled
+            let n = pread(fd, buf, len, off_t(offset))
+            guard n == len else {
+                let reason = n < 0 ? errnoString() : "end of media"
+                throw DumpError("\(tag): read error at sector \(offset / UInt64(sector)), "
+                                + "\(formatBytes(offset)) of \(formatBytes(total)): \(reason). "
+                                + "Clean the disc and try again.")
             }
-            guard writeAll(out, buf, got) else {
+            guard writeAll(out, buf, len) else {
                 let reason = errnoString()
                 throw DumpError("\(tag): write error: \(reason)")
             }
-            offset += UInt64(got)
-            if got < len {
-                let reason = err == 0 ? "end of media" : String(cString: strerror(err))
-                throw DumpError("\(tag): read error at sector \(offset / UInt64(sector)) of \(sectors) (\(reason)). "
-                                + "\(formatBytes(offset)) saved in \(url.lastPathComponent)")
-            }
+            offset += UInt64(len)
             if Date().timeIntervalSince(lastReport) >= 0.25 || offset == total {
                 lastReport = Date()
                 reportISO(tag: tag, path: path, done: offset, total: total, start: start)
             }
         }
-        outOpen = false
-        guard close(out) == 0 else {
-            let reason = errnoString()
-            throw DumpError("\(tag): write error: \(reason)")
-        }
-        return url.lastPathComponent
-    }
-
-    /// Reads len bytes at offset. On error it tries again, then reads one sector at a time
-    /// to keep the good data before the bad sector. Returns the bytes read and the errno.
-    private func readBlock(_ fd: Int32, _ buf: UnsafeMutableRawPointer, _ len: Int,
-                           _ offset: UInt64, _ sector: Int) -> (Int, Int32) {
-        for _ in 0..<2 {
-            if pread(fd, buf, len, off_t(offset)) == len { return (len, 0) }
-        }
-        var done = 0
-        while done < len {
-            var err: Int32 = 0
-            var ok = false
-            for _ in 0..<2 where !ok && !appState.cancelled {
-                let n = pread(fd, buf + done, sector, off_t(offset) + off_t(done))
-                ok = n == sector
-                if n < 0 { err = errno }
-            }
-            if !ok { return (done, err) }
-            done += sector
-        }
-        return (len, 0)
     }
 
     private func reportISO(tag: String, path: String, done: UInt64, total: UInt64, start: Date) {
@@ -308,7 +304,7 @@ final class Dumper {
                 return AuthorizationCopyRights(auth, &rights, nil, [.interactionAllowed, .extendRights], nil)
             }
         }
-        if status == errAuthorizationCanceled { throw DumpError("Authorization cancelled") }
+        if status == errAuthorizationCanceled { throw DumpError("Authorization cancelled", isCancel: true) }
         guard status == errAuthorizationSuccess else { throw DumpError("Authorization failed (\(status))") }
 
         var extForm = AuthorizationExternalForm()
@@ -427,14 +423,15 @@ final class Dumper {
             throw DumpError("\(tag): not an archive format")
         }
 
-        let (code, lastError) = try runTool(tool, cwd: root, output: url, tag: tag)
+        let (code, errorText) = try runTool(tool, cwd: root, output: url, tag: tag)
         if appState.cancelled {
             unlink(url.path)
             throw DumpError.cancelled
         }
-        guard code == 0 else {
+        guard code == 0, errorText == nil else {
+            unlink(url.path)  // never keep an incomplete archive
             let name = URL(fileURLWithPath: tool.path).lastPathComponent
-            throw DumpError("\(tag): \(name) failed with exit code \(code)" + (lastError.map { ": \($0)" } ?? ""))
+            throw DumpError("\(tag): " + (errorText ?? "\(name) failed with exit code \(code)"))
         }
     }
 
@@ -479,7 +476,7 @@ final class Dumper {
         }
 
         while proc.isRunning {
-            if appState.cancelled { proc.terminate() }
+            if appState.cancelled || lines.errorText != nil { proc.terminate() }  // stop at the first error
             let done = lines.entries
             let size = (try? FileManager.default.attributesOfItem(atPath: output.path)[.size] as? UInt64) ?? 0
             setProgress(tool.total > 0 ? min(Double(done) / Double(tool.total), 0.99) : 0)
@@ -487,14 +484,14 @@ final class Dumper {
             Thread.sleep(forTimeInterval: 0.25)
         }
         reader.wait()
-        return (proc.terminationStatus, lines.lastError)
+        return (proc.terminationStatus, lines.errorText)
     }
 
     private final class LineReader {
         private let lock = NSLock()
         private var buffer = Data()
         private var count = 0
-        private var error: String?
+        private var errors: [String] = []
         private let isEntry: (String) -> Bool
         private let isError: (String) -> Bool
 
@@ -508,9 +505,10 @@ final class Dumper {
             return count
         }
 
-        var lastError: String? {
+        /// The first two error lines: the tools often name the file in the second one.
+        var errorText: String? {
             lock.lock(); defer { lock.unlock() }
-            return error
+            return errors.isEmpty ? nil : errors.joined(separator: "; ")
         }
 
         func feed(_ data: Data) {
@@ -523,7 +521,7 @@ final class Dumper {
                 if isEntry(line) {
                     count += 1
                 } else if isError(line) {
-                    error = line
+                    if errors.count < 2 && !errors.contains(line) { errors.append(line) }
                 }
             }
         }
