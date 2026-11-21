@@ -13,6 +13,15 @@ On the first read error it stops, with no retries, deletes the incomplete file a
 Clean the disc and dump it again.
 Reading the raw device needs root: Dumpus asks for an admin password, like Dufus.
 
+## Password prompts
+
+To stop the password prompts, choose **Dumpus > Install Disk Helper…** once. It installs a small setuid
+helper in `/Library/PrivilegedHelperTools` that opens disks for Dumpus without a prompt.
+The helper opens disks **read-only** and cannot write anything. It only opens removable media
+(CD, DVD, SD card, most USB sticks) with no mounted volumes, and only for admin users running the signed
+Dumpus app. Fixed disks (internal, external HDD/SSD) and disk images still ask for the password.
+Remove it with **Uninstall Disk Helper…**.
+
 RAR needs `rar` from [rarlab.com](https://www.rarlab.com) in `/opt/homebrew/bin`, `/usr/local/bin` or `~/bin`.
 
 Build: `make app` (or `make` for a DMG).

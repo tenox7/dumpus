@@ -30,6 +30,33 @@ struct DumpusApp: App {
             ContentView(appState: appState)
         }
         .windowResizability(.contentSize)
+        .commands {
+            CommandGroup(after: .appInfo) {
+                Divider()
+                Button(appState.helperInstalled ? "Reinstall Disk Helper…" : "Install Disk Helper…") {
+                    changeHelper(install: true)
+                }
+                .disabled(appState.busy)
+                Button("Uninstall Disk Helper…") {
+                    changeHelper(install: false)
+                }
+                .disabled(appState.busy || !appState.helperInstalled)
+            }
+        }
+    }
+
+    private func changeHelper(install: Bool) {
+        appState.isError = false
+        appState.status = install ? "Installing disk helper…" : "Removing disk helper…"
+        DispatchQueue.global(qos: .userInitiated).async {
+            let error = install ? Helper.install() : Helper.uninstall()
+            DispatchQueue.main.async {
+                appState.helperInstalled = Helper.isInstalled
+                appState.status = error ?? (install ? "Disk helper installed: no more password prompts"
+                                                    : "Disk helper removed")
+                appState.isError = error != nil && error != "Cancelled"
+            }
+        }
     }
 }
 
@@ -38,5 +65,6 @@ class AppState: ObservableObject {
     @Published var status: String = "Ready"
     @Published var isError: Bool = false
     @Published var busy: Bool = false
+    @Published var helperInstalled = Helper.isInstalled
     var cancelled: Bool = false
 }

@@ -7,6 +7,14 @@ let package = Package(
     targets: [
         .target(name: "CDumpus"),
         .executableTarget(
+            name: "DumpusHelper",
+            linkerSettings: [
+                .linkedFramework("CoreFoundation"),
+                .linkedFramework("IOKit"),
+                .linkedFramework("Security"),
+            ]
+        ),
+        .executableTarget(
             name: "Dumpus",
             dependencies: ["CDumpus"],
             linkerSettings: [

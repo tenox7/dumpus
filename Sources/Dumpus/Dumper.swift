@@ -275,6 +275,8 @@ final class Dumper {
 
     // MARK: - Root access to the device (same as Dufus)
 
+    /// Opens the device read-only: directly if the user may read it (disk images),
+    /// else with the installed disk helper (no prompt), else with authopen (admin password prompt).
     private func openDevice(_ path: String) throws -> Int32 {
         let fd = open(path, O_RDONLY)
         if fd >= 0 { return fd }
@@ -282,7 +284,17 @@ final class Dumper {
         guard err == EACCES || err == EPERM else {
             throw DumpError("Cannot open \(path): \(String(cString: strerror(err)))")
         }
-        setStatus("Waiting for authorization to read \(path)…")
+        if Helper.isInstalled {
+            setStatus("Opening \(path)…")
+            do {
+                return try receiveFD(from: Helper.installedPath, arguments: [path])
+            } catch {
+                let why = (error as? DumpError)?.message ?? "failed"
+                setStatus("Disk helper: \(why). Waiting for authorization to read \(path)…")
+            }
+        } else {
+            setStatus("Waiting for authorization to read \(path)…")
+        }
         return try authOpen(path)
     }
 
@@ -312,36 +324,56 @@ final class Dumper {
             throw DumpError("Authorization failed")
         }
 
+        let input = withUnsafeBytes(of: &extForm) { Data($0) }
+        do {
+            return try receiveFD(from: "/usr/libexec/authopen", arguments: ["-stdoutpipe", "-extauth", path], input: input)
+        } catch {
+            throw DumpError("authopen cannot open \(path): \((error as? DumpError)?.message ?? "failed")")
+        }
+    }
+
+    /// Runs a tool that sends an open descriptor back over stdout (SCM_RIGHTS), like `authopen -stdoutpipe`.
+    /// Throws the tool's error message.
+    private func receiveFD(from tool: String, arguments: [String], input: Data? = nil) throws -> Int32 {
         var fds: [Int32] = [0, 0]
         guard socketpair(AF_UNIX, SOCK_STREAM, 0, &fds) == 0 else {
             let reason = errnoString()
             throw DumpError("socketpair: \(reason)")
         }
 
+        let name = URL(fileURLWithPath: tool).lastPathComponent
         let stdinPipe = Pipe()
+        let errPipe = Pipe()
         let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/usr/libexec/authopen")
-        proc.arguments = ["-stdoutpipe", "-extauth", path]
+        proc.executableURL = URL(fileURLWithPath: tool)
+        proc.arguments = arguments
         proc.standardOutput = FileHandle(fileDescriptor: fds[1], closeOnDealloc: false)
-        proc.standardInput = stdinPipe
+        proc.standardInput = input == nil ? FileHandle.nullDevice : stdinPipe
+        proc.standardError = errPipe
         do {
             try proc.run()
         } catch {
             close(fds[0])
             close(fds[1])
-            throw DumpError("Cannot run authopen: \(error.localizedDescription)")
+            throw DumpError("cannot run \(name): \(error.localizedDescription)")
         }
         close(fds[1])
 
-        withUnsafeBytes(of: &extForm) { stdinPipe.fileHandleForWriting.write(Data($0)) }
-        stdinPipe.fileHandleForWriting.closeFile()
+        if let input {
+            stdinPipe.fileHandleForWriting.write(input)
+            stdinPipe.fileHandleForWriting.closeFile()
+        }
 
         let fd = recv_fd(fds[0])
         close(fds[0])
+        let errText = String(decoding: errPipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
         proc.waitUntilExit()
         guard proc.terminationStatus == 0, fd >= 0 else {
             if fd >= 0 { close(fd) }
-            throw DumpError("authopen cannot open \(path)")
+            let lastLine = errText.split(whereSeparator: \.isNewline).last.map(String.init)
+            let message = lastLine?.replacingOccurrences(of: "DumpusHelper: ", with: "")
+                .trimmingCharacters(in: .whitespaces)
+            throw DumpError(message ?? "\(name) failed with exit code \(proc.terminationStatus)")
         }
         return fd
     }
