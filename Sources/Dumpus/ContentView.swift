@@ -12,7 +12,7 @@ struct ContentView: View {
     @State private var showReplace = false
     @AppStorage("outputDir") private var outputDir = ContentView.defaultDir
     @AppStorage("formatISO") private var iso = true
-    @AppStorage("formatTAR") private var tar = false
+    @AppStorage("formatTLZ") private var tlz = false
     @AppStorage("formatRAR") private var rar = false
     @AppStorage("formatZIP") private var zip = false
     @AppStorage("blockSize") private var blockSize = 1 << 20
@@ -57,8 +57,9 @@ struct ContentView: View {
                     Text("Format:")
                     HStack(spacing: 16) {
                         Toggle("ISO", isOn: $iso)
-                        Toggle("TAR", isOn: archive($tar))
+                        Toggle("TLZ", isOn: archive($tlz))
                             .disabled(!mountable)
+                            .help(Dumper.plzipPath == nil ? "plzip not found, so TLZ writes .tar.gz. Install plzip for .tar.lz." : "")
                         Toggle("RAR", isOn: archive($rar, available: Dumper.rarPath != nil))
                             .disabled(!mountable || Dumper.rarPath == nil)
                             .help(Dumper.rarPath == nil ? "rar not found. Install it from rarlab.com." : "")
@@ -174,7 +175,7 @@ struct ContentView: View {
         diskManager.disks.first { $0.id == selectedID }
     }
 
-    /// TAR, RAR and ZIP need a file system that macOS can mount. Without a disk, keep them on.
+    /// TLZ, RAR and ZIP need a file system that macOS can mount. Without a disk, keep them on.
     private var mountable: Bool {
         selectedDisk?.mountable ?? true
     }
@@ -186,15 +187,15 @@ struct ContentView: View {
 
     private var formats: [DumpFormat] {
         let rarOK = Dumper.rarPath != nil
-        return [iso ? .iso : nil, tar && mountable ? .tar : nil, rar && rarOK && mountable ? .rar : nil,
+        return [iso ? .iso : nil, tlz && mountable ? .tlz : nil, rar && rarOK && mountable ? .rar : nil,
                 zip && mountable ? .zip : nil].compactMap { $0 }
     }
 
     /// The name without a dump extension the user may have typed.
     private var baseName: String {
-        var name = sanitizeFileName(fileName)
-        if DumpFormat(rawValue: (name as NSString).pathExtension.lowercased()) != nil {
-            name = (name as NSString).deletingPathExtension
+        let name = sanitizeFileName(fileName)
+        for ext in DumpFormat.knownExtensions where name.lowercased().hasSuffix("." + ext) {
+            return String(name.dropLast(ext.count + 1))
         }
         return name
     }
@@ -230,7 +231,7 @@ struct ContentView: View {
 
     private func startDump() {
         let dir = URL(fileURLWithPath: outputDir, isDirectory: true)
-        replaceNames = formats.map { "\(baseName).\($0.rawValue)" }
+        replaceNames = formats.map { "\(baseName).\($0.ext)" }
             .filter { FileManager.default.fileExists(atPath: dir.appendingPathComponent($0).path) }
         if replaceNames.isEmpty {
             launch()

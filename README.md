@@ -4,7 +4,8 @@ A GUI media dumper for macOS. Dufus in reverse: it dumps CD, DVD and USB media t
 
 - **ISO**: raw copy of the unmounted media, like `sudo dd if=/dev/rdiskNs0 bs=1m`.
   CDs use the data partition (`diskNs0` or the first data track), other media use the whole disk.
-- **TAR**, **RAR**, **ZIP**: the files of the mounted volume (`tar`, `rar`, `zip`).
+- **TLZ**, **RAR**, **ZIP**: the files of the mounted volume (`tar`, `rar`, `zip`).
+  TLZ is a tar compressed with `plzip -9`, saved as `name.tar.lz`. Without plzip, it is a `name.tar.gz`.
   RAR uses best compression (`-m5`), a 16 GB dictionary (`-md16g`), solid mode (`-s`) and a recovery record (`-rr`).
   If macOS cannot mount the file system (for example EFS or UFS), only ISO is possible.
 
@@ -23,5 +24,7 @@ Dumpus app. Fixed disks (internal, external HDD/SSD) and disk images still ask f
 Remove it with **Uninstall Disk Helper…**.
 
 RAR needs `rar` from [rarlab.com](https://www.rarlab.com) in `/opt/homebrew/bin`, `/usr/local/bin` or `~/bin`.
+TLZ looks for `plzip` (`brew install plzip`) in the same folders.
 
 Build: `make app` (or `make` for a DMG).
+Release: `git tag 1.2.3`, then `make release`. The app version comes from the git tag.

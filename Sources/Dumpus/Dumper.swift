@@ -3,8 +3,16 @@ import Security
 import CDumpus
 
 enum DumpFormat: String, CaseIterable {
-    case iso, tar, rar, zip
+    case iso, tlz, rar, zip
     var label: String { rawValue.uppercased() }
+
+    /// The file name extension. TLZ is a tar that plzip compresses, or gzip when plzip is not installed.
+    var ext: String {
+        self == .tlz ? (Dumper.plzipPath != nil ? "tar.lz" : "tar.gz") : rawValue
+    }
+
+    /// The extensions that Dumpus writes, and plain tar.
+    static let knownExtensions = ["iso", "tar.lz", "tar.gz", "tar", "rar", "zip"]
 }
 
 struct DumpJob {
@@ -21,11 +29,16 @@ extension DumpError {
 }
 
 final class Dumper {
-    static let rarPath: String? = {
+    static let rarPath = findTool("rar")
+    static let plzipPath = findTool("plzip")
+
+    /// Apps that start from the Finder do not get the shell's PATH, so look in the usual folders.
+    private static func findTool(_ name: String) -> String? {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
-        return ["/opt/homebrew/bin/rar", "/usr/local/bin/rar", "/opt/local/bin/rar", "\(home)/bin/rar", "/usr/bin/rar"]
+        return ["/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin", "\(home)/bin", "/usr/bin"]
+            .map { "\($0)/\(name)" }
             .first { FileManager.default.isExecutableFile(atPath: $0) }
-    }()
+    }
 
     /// Folders that macOS makes on writable volumes. They are not part of the media.
     static let systemFolders: Set<String> = [
@@ -34,7 +47,7 @@ final class Dumper {
 
     private static let queue = DispatchQueue(label: "dumpus.work", qos: .userInitiated)
     private static let runningLock = NSLock()
-    private static var runningTool: Process?
+    private static var runningTools: [Process] = []
     private static var authRef: AuthorizationRef?
 
     private let appState: AppState
@@ -87,7 +100,7 @@ final class Dumper {
 
     static func stopRunningTool() {
         runningLock.lock()
-        runningTool?.terminate()
+        runningTools.filter(\.isRunning).forEach { $0.terminate() }
         runningLock.unlock()
     }
 
@@ -378,7 +391,7 @@ final class Dumper {
         return fd
     }
 
-    // MARK: - TAR, RAR, ZIP
+    // MARK: - TLZ, RAR, ZIP
 
     private func archive(_ format: DumpFormat, _ job: DumpJob, tag: String) throws -> [String] {
         var volumes = DiskManager.dataVolumes(of: job.disk)
@@ -400,8 +413,8 @@ final class Dumper {
         var names: [String] = []
         for vol in volumes {
             let url = volumes.count == 1
-                ? job.directory.appendingPathComponent("\(job.baseName).\(format.rawValue)")
-                : uniqueURL(job.directory, "\(job.baseName)-\(sanitizeFileName(vol.name))", format.rawValue)
+                ? job.directory.appendingPathComponent("\(job.baseName).\(format.ext)")
+                : uniqueURL(job.directory, "\(job.baseName)-\(sanitizeFileName(vol.name))", format.ext)
             try archiveVolume(format, vol, to: url, tag: tag)
             names.append(url.lastPathComponent)
         }
@@ -414,6 +427,8 @@ final class Dumper {
         let total: Int
         let isEntry: (String) -> Bool
         let isError: (String) -> Bool
+        /// A compressor and its arguments. The tool writes the archive to the compressor, which writes the file.
+        var compressor: [String]? = nil
     }
 
     private func archiveVolume(_ format: DumpFormat, _ vol: Volume, to url: URL, tag: String) throws {
@@ -430,12 +445,23 @@ final class Dumper {
 
         let tool: Tool
         switch format {
-        case .tar:
-            tool = Tool(path: "/usr/bin/tar",
-                        args: ["-c", "-v", "-f", url.path, "-C", root.path] + items,
-                        total: count.files + count.dirs,
-                        isEntry: { $0.hasPrefix("a ") },
-                        isError: { $0.hasPrefix("tar: ") })
+        case .tlz:
+            // tar lists the files on stderr. With plzip, tar writes the archive to stdout, for plzip.
+            if let plzip = Self.plzipPath {
+                tool = Tool(path: "/usr/bin/tar",
+                            args: ["-c", "-v", "-f", "-", "-C", root.path] + items,
+                            total: count.files + count.dirs,
+                            isEntry: { $0.hasPrefix("a ") },
+                            isError: { $0.hasPrefix("tar: ") || $0.hasPrefix("plzip: ") },
+                            compressor: [plzip, "-9"])
+            } else {
+                tool = Tool(path: "/usr/bin/tar",
+                            args: ["-c", "-z", "--options", "gzip:compression-level=9", "-v", "-f", url.path,
+                                   "-C", root.path] + items,
+                            total: count.files + count.dirs,
+                            isEntry: { $0.hasPrefix("a ") },
+                            isError: { $0.hasPrefix("tar: ") })
+            }
         case .zip:
             tool = Tool(path: "/usr/bin/zip",
                         args: ["-r", "-y", url.path] + items,
@@ -455,68 +481,124 @@ final class Dumper {
             throw DumpError("\(tag): not an archive format")
         }
 
-        let (code, errorText) = try runTool(tool, cwd: root, output: url, tag: tag)
+        let failure = runTool(tool, cwd: root, output: url, tag: tag)
         if appState.cancelled {
             unlink(url.path)
             throw DumpError.cancelled
         }
-        guard code == 0, errorText == nil else {
+        if let failure {
             unlink(url.path)  // never keep an incomplete archive
-            let name = URL(fileURLWithPath: tool.path).lastPathComponent
-            throw DumpError("\(tag): " + (errorText ?? "\(name) failed with exit code \(code)"))
+            throw DumpError("\(tag): \(failure)")
         }
     }
 
-    private func runTool(_ tool: Tool, cwd: URL, output: URL, tag: String) throws -> (Int32, String?) {
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: tool.path)
-        proc.arguments = tool.args
-        proc.currentDirectoryURL = cwd
+    /// Runs the tool, and the compressor on its output when it has one, and shows the progress.
+    /// Returns why it failed, or nil.
+    private func runTool(_ tool: Tool, cwd: URL, output: URL, tag: String) -> String? {
+        // Raw descriptors that close on exec: each program gets only its own pipe ends, so the compressor
+        // sees the end of its input when tar stops. Each program writes its file list and errors to its own
+        // message pipe: in one shared pipe, their lines would mix.
+        var fds: Set<Int32> = []
+        defer { fds.forEach { close($0) } }
+        func makePipe() -> (read: Int32, write: Int32)? {
+            var ends: [Int32] = [0, 0]
+            guard pipe(&ends) == 0 else { return nil }
+            ends.forEach { _ = fcntl($0, F_SETFD, FD_CLOEXEC) }
+            fds.formUnion(ends)
+            return (ends[0], ends[1])
+        }
+        func pipeError() -> String { "pipe: \(errnoString())" }
+
         var env = ProcessInfo.processInfo.environment
         env["LC_ALL"] = "en_US.UTF-8"  // without a UTF-8 locale tar fails on non-ASCII file names
-        proc.environment = env
-        proc.standardInput = FileHandle.nullDevice
-        let pipe = Pipe()
-        proc.standardOutput = pipe
-        proc.standardError = pipe
-
-        let lines = LineReader(isEntry: tool.isEntry, isError: tool.isError)
-        do {
-            try proc.run()
-        } catch {
-            throw DumpError("\(tag): cannot run \(tool.path): \(error.localizedDescription)")
+        var procs: [Process] = []
+        var messages: [Int32] = []  // read ends of the message pipes, one for each program
+        /// Adds a program. Without `stdout`, its output goes to its message pipe.
+        func add(_ command: [String], stdin: Int32? = nil, stdout: Int32? = nil) -> Bool {
+            guard let ends = makePipe() else { return false }
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: command[0])
+            proc.arguments = Array(command.dropFirst())
+            proc.currentDirectoryURL = cwd
+            proc.environment = env
+            proc.standardInput = stdin.map { FileHandle(fileDescriptor: $0, closeOnDealloc: false) }
+                ?? FileHandle.nullDevice
+            proc.standardOutput = FileHandle(fileDescriptor: stdout ?? ends.write, closeOnDealloc: false)
+            proc.standardError = FileHandle(fileDescriptor: ends.write, closeOnDealloc: false)
+            procs.append(proc)
+            messages.append(ends.read)
+            return true
         }
+
+        if let compressor = tool.compressor {
+            guard let stream = makePipe() else { return pipeError() }
+            let file = open(output.path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0o644)
+            guard file >= 0 else {
+                let reason = errnoString()
+                return "cannot create \(output.lastPathComponent): \(reason)"
+            }
+            fds.insert(file)
+            guard add([tool.path] + tool.args, stdout: stream.write),
+                  add(compressor, stdin: stream.read, stdout: file) else { return pipeError() }
+        } else {
+            guard add([tool.path] + tool.args) else { return pipeError() }
+        }
+        for proc in procs {
+            do {
+                try proc.run()
+            } catch {
+                procs.filter(\.isRunning).forEach { $0.terminate() }
+                return "cannot run \(proc.executableURL?.path ?? "?"): \(error.localizedDescription)"
+            }
+        }
+        // The programs have their ends now. The parent keeps only the read ends of the message pipes.
+        fds.subtracting(messages).forEach { close($0) }
+        fds = Set(messages)
+
         Self.runningLock.lock()
-        Self.runningTool = proc
+        Self.runningTools = procs
         Self.runningLock.unlock()
         defer {
             Self.runningLock.lock()
-            Self.runningTool = nil
+            Self.runningTools = []
             Self.runningLock.unlock()
         }
 
-        let reader = DispatchGroup()
-        reader.enter()
-        DispatchQueue.global(qos: .utility).async {
-            let handle = pipe.fileHandleForReading
-            while true {
-                let data = handle.availableData
-                if data.isEmpty { break }
-                lines.feed(data)
+        let readers = messages.map { _ in LineReader(isEntry: tool.isEntry, isError: tool.isError) }
+        let reading = DispatchGroup()
+        for (fd, lines) in zip(messages, readers) {
+            reading.enter()
+            DispatchQueue.global(qos: .utility).async {
+                let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: false)
+                while true {
+                    let data = handle.availableData
+                    if data.isEmpty { break }
+                    lines.feed(data)
+                }
+                reading.leave()
             }
-            reader.leave()
         }
+        // When the compressor fails, tar only reports the broken pipe. So the compressor's errors come first.
+        func errorText() -> String? { readers.reversed().lazy.compactMap(\.errorText).first }
 
-        while proc.isRunning {
-            if appState.cancelled || lines.errorText != nil { proc.terminate() }  // stop at the first error
-            let done = lines.entries
+        while procs.contains(where: \.isRunning) {
+            if appState.cancelled || errorText() != nil {  // stop at the first error
+                procs.filter(\.isRunning).forEach { $0.terminate() }
+            }
+            let done = readers.map(\.entries).reduce(0, +)
             let size = (try? FileManager.default.attributesOfItem(atPath: output.path)[.size] as? UInt64) ?? 0
             setProgress(tool.total > 0 ? min(Double(done) / Double(tool.total), 0.99) : 0)
             setStatus("\(tag): \(done) of \(tool.total) files, \(formatBytes(size)) in \(output.lastPathComponent)")
             Thread.sleep(forTimeInterval: 0.25)
         }
-        reader.wait()
-        return (proc.terminationStatus, lines.errorText)
+        reading.wait()
+        if let text = errorText() { return text }
+        // Without an error message, also name the compressor first.
+        guard let failed = procs.last(where: { $0.terminationStatus != 0 }) else { return nil }
+        let name = failed.executableURL?.lastPathComponent ?? "?"
+        return failed.terminationReason == .uncaughtSignal
+            ? "\(name) stopped by signal \(failed.terminationStatus)"
+            : "\(name) failed with exit code \(failed.terminationStatus)"
     }
 
     private final class LineReader {

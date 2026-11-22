@@ -9,7 +9,7 @@ struct DiskInfo: Identifiable, Hashable {
     let volumeName: String
     let mediaKind: String   // "CD", "DVD", "BD" or ""
     let mounted: Bool
-    let mountable: Bool     // has a file system that macOS can mount (TAR, RAR, ZIP need it)
+    let mountable: Bool     // has a file system that macOS can mount (TLZ, RAR, ZIP need it)
 
     var devicePath: String { "/dev/\(id)" }
 
